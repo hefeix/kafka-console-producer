@@ -22,6 +22,7 @@ import joptsimple._
 import java.util.Properties
 import java.io._
 import java.net._
+import kafka.common._
 import kafka.message._
 import kafka.serializer._
 
@@ -33,9 +34,9 @@ object ConsoleProducer {
                            .withRequiredArg
                            .describedAs("topic")
                            .ofType(classOf[String])
-    val zkConnectOpt = parser.accepts("zookeeper", "REQUIRED: The zookeeper connection string for the kafka zookeeper instance in the form HOST:PORT[/CHROOT].")
+    val brokerListOpt = parser.accepts("broker-list", "REQUIRED: The broker list string in the form HOST1:PORT1,HOST2:PORT2.")
                            .withRequiredArg
-                           .describedAs("connection_string")
+                           .describedAs("broker-list")
                            .ofType(classOf[String])
     val syncOpt = parser.accepts("sync", "If set message send requests to the brokers are synchronously, one at a time as they arrive.")
     val compressOpt = parser.accepts("compress", "If set, messages batches are sent compressed")
@@ -50,17 +51,48 @@ object ConsoleProducer {
                                .describedAs("timeout_ms")
                                .ofType(classOf[java.lang.Long])
                                .defaultsTo(1000)
-    val messageEncoderOpt = parser.accepts("message-encoder", "The class name of the message encoder implementation to use.")
+    val queueSizeOpt = parser.accepts("queue-size", "If set and the producer is running in asynchronous mode, this gives the maximum amount of " +
+                                                   " messages will queue awaiting suffient batch size.")
+                               .withRequiredArg
+                               .describedAs("queue_size")
+                               .ofType(classOf[java.lang.Long])
+                               .defaultsTo(10000)
+    val queueEnqueueTimeoutMsOpt = parser.accepts("queue-enqueuetimeout-ms", "Timeout for event enqueue")
+                               .withRequiredArg
+                               .describedAs("queue enqueuetimeout ms")
+                               .ofType(classOf[java.lang.Long])
+                               .defaultsTo(0)
+    val requestRequiredAcksOpt = parser.accepts("request-required-acks", "The required acks of the producer requests")
+                               .withRequiredArg
+                               .describedAs("request required acks")
+                               .ofType(classOf[java.lang.Integer])
+                               .defaultsTo(0)
+    val requestTimeoutMsOpt = parser.accepts("request-timeout-ms", "The ack timeout of the producer requests. Value must be non-negative and non-zero")
+                               .withRequiredArg
+                               .describedAs("request timeout ms")
+                               .ofType(classOf[java.lang.Integer])
+                               .defaultsTo(1500)
+    val valueEncoderOpt = parser.accepts("value-serializer", "The class name of the message encoder implementation to use for serializing values.")
+                                 .withRequiredArg
+                                 .describedAs("encoder_class")
+                                 .ofType(classOf[java.lang.String])
+                                 .defaultsTo(classOf[StringEncoder].getName)
+    val keyEncoderOpt = parser.accepts("key-serializer", "The class name of the message encoder implementation to use for serializing keys.")
                                  .withRequiredArg
                                  .describedAs("encoder_class")
                                  .ofType(classOf[java.lang.String])
                                  .defaultsTo(classOf[StringEncoder].getName)
     val messageReaderOpt = parser.accepts("line-reader", "The class name of the class to use for reading lines from standard in. " +
-                                                          "By default each line is read as a seperate message.")
+                                                          "By default each line is read as a separate message.")
                                   .withRequiredArg
                                   .describedAs("reader_class")
                                   .ofType(classOf[java.lang.String])
                                   .defaultsTo(classOf[LineMessageReader].getName)
+    val socketBufferSizeOpt = parser.accepts("socket-buffer-size", "The size of the tcp RECV size.")
+                                  .withRequiredArg
+                                  .describedAs("size")
+                                  .ofType(classOf[java.lang.Integer])
+                                  .defaultsTo(1024*100)
     val propertyOpt = parser.accepts("property", "A mechanism to pass user-defined properties in the form key=value to the message reader. " +
                                                  "This allows custom configuration for a user-defined message reader.")
                             .withRequiredArg
@@ -82,7 +114,7 @@ object ConsoleProducer {
                             .defaultsTo(60000)
 
     val options = parser.parse(args : _*)
-    for(arg <- List(topicOpt, zkConnectOpt)) {
+    for(arg <- List(topicOpt, brokerListOpt)) {
       if(!options.has(arg)) {
         System.err.println("Missing required argument \"" + arg + "\"")
         parser.printHelpOn(System.err)
@@ -91,23 +123,37 @@ object ConsoleProducer {
     }
 
     val topic = options.valueOf(topicOpt)
-    val zkConnect = options.valueOf(zkConnectOpt)
+    val brokerList = options.valueOf(brokerListOpt)
     val sync = options.has(syncOpt)
     val compress = options.has(compressOpt)
     val batchSize = options.valueOf(batchSizeOpt)
     val sendTimeout = options.valueOf(sendTimeoutOpt)
-    val encoderClass = options.valueOf(messageEncoderOpt)
+    val queueSize = options.valueOf(queueSizeOpt)
+    val queueEnqueueTimeoutMs = options.valueOf(queueEnqueueTimeoutMsOpt)
+    val requestRequiredAcks = options.valueOf(requestRequiredAcksOpt)
+    val requestTimeoutMs = options.valueOf(requestTimeoutMsOpt)
+    val keyEncoderClass = options.valueOf(keyEncoderOpt)
+    val valueEncoderClass = options.valueOf(valueEncoderOpt)
     val readerClass = options.valueOf(messageReaderOpt)
+    val socketBuffer = options.valueOf(socketBufferSizeOpt)
     val cmdLineProps = parseLineReaderArgs(options.valuesOf(propertyOpt))
+    cmdLineProps.put("topic", topic)
 
     val props = new Properties()
-    props.put("zk.connect", zkConnect)
-    props.put("compression.codec", DefaultCompressionCodec.codec.toString)
+    props.put("metadata.broker.list", brokerList)
+    val codec = if(compress) DefaultCompressionCodec.codec else NoCompressionCodec.codec
+    props.put("compression.codec", codec.toString)
     props.put("producer.type", if(sync) "sync" else "async")
     if(options.has(batchSizeOpt))
-      props.put("batch.size", batchSize.toString)
-    props.put("queue.time", sendTimeout.toString)
-    props.put("serializer.class", encoderClass)
+      props.put("batch.num.messages", batchSize.toString)
+    props.put("queue.buffering.max.ms", sendTimeout.toString)
+    props.put("queue.buffering.max.messages", queueSize.toString)
+    props.put("queue.enqueue.timeout.ms", queueEnqueueTimeoutMs.toString)
+    props.put("request.required.acks", requestRequiredAcks.toString)
+    props.put("request.timeout.ms", requestTimeoutMs.toString)
+    props.put("key.serializer.class", keyEncoderClass)
+    props.put("serializer.class", valueEncoderClass)
+    props.put("send.buffer.bytes", socketBuffer.toString)
 
     val file = options.valueOf(fileOpt)
     val urlFactoryClass = options.valueOf(urlFactoryOpt)
@@ -116,7 +162,7 @@ object ConsoleProducer {
     }
     val idleTime = options.valueOf(idleTimeOpt).asInstanceOf[Long]
 
-    val reader = Class.forName(readerClass).newInstance().asInstanceOf[MessageReader]
+    val reader = Class.forName(readerClass).newInstance().asInstanceOf[MessageReader[AnyRef, AnyRef]]
     if(file == null) {
       reader.init(System.in, cmdLineProps)
     }
@@ -124,21 +170,26 @@ object ConsoleProducer {
       reader.init(new URL(file).openStream(), cmdLineProps)
     }
 
-    val producer = new Producer[Any, Any](new ProducerConfig(props))
+    try {
+        val producer = new Producer[AnyRef, AnyRef](new ProducerConfig(props))
 
-    Runtime.getRuntime.addShutdownHook(new Thread() {
-      override def run() {
-        producer.close()
-      }
-    })
+        Runtime.getRuntime.addShutdownHook(new Thread() {
+          override def run() {
+            producer.close()
+          }
+        })
 
-    var message: AnyRef = null
-    do {
-      message = reader.readMessage()
-      if(message != null)
-        producer.send(new ProducerData(topic, message))
-    } while(message != null)
-
+        var message: KeyedMessage[AnyRef, AnyRef] = null
+        do {
+          message = reader.readMessage()
+          if(message != null)
+            producer.send(message)
+        } while(message != null)
+    } catch {
+      case e: Exception =>
+        e.printStackTrace
+        System.exit(1)
+    }
     Thread.sleep(idleTime)
     System.exit(0)
   }
@@ -155,19 +206,50 @@ object ConsoleProducer {
     props
   }
 
-  trait MessageReader {
+  trait MessageReader[K,V] {
     def init(inputStream: InputStream, props: Properties) {}
-    def readMessage(): AnyRef
+    def readMessage(): KeyedMessage[K,V]
     def close() {}
   }
 
-  class LineMessageReader extends MessageReader {
+  class LineMessageReader extends MessageReader[String, String] {
+    var topic: String = null
     var reader: BufferedReader = null
+    var parseKey = false
+    var keySeparator = "\t"
+    var ignoreError = false
+    var lineNumber = 0
 
     override def init(inputStream: InputStream, props: Properties) {
+      topic = props.getProperty("topic")
+      if(props.containsKey("parse.key"))
+        parseKey = props.getProperty("parse.key").trim.toLowerCase.equals("true")
+      if(props.containsKey("key.separator"))
+        keySeparator = props.getProperty("key.separator")
+      if(props.containsKey("ignore.error"))
+        ignoreError = props.getProperty("ignore.error").trim.toLowerCase.equals("true")
       reader = new BufferedReader(new InputStreamReader(inputStream))
     }
 
-    override def readMessage() = reader.readLine()
+    override def readMessage() = {
+      lineNumber += 1
+      (reader.readLine(), parseKey) match {
+        case (null, _) => null
+        case (line, true) =>
+          line.indexOf(keySeparator) match {
+            case -1 =>
+              if(ignoreError)
+                new KeyedMessage(topic, line)
+              else
+                throw new KafkaException("No key found on line " + lineNumber + ": " + line)
+            case n =>
+              new KeyedMessage(topic,
+                             line.substring(0, n),
+                             if(n + keySeparator.size > line.size) "" else line.substring(n + keySeparator.size))
+          }
+        case (line, false) =>
+          new KeyedMessage(topic, line)
+      }
+    }
   }
 }
